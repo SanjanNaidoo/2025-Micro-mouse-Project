@@ -84,7 +84,6 @@ static void MX_NVIC_Init(void);
 /* USER CODE BEGIN 0 */
 int8_t expectedHeader[3] = {'J', '_', 'A'};
 int8_t expectedTerminator[3] = {'A', '_', 'J'};
-
 int32_t counter = 0;
 
 // from this file
@@ -129,6 +128,84 @@ extern int16_t Vbattery, Vshunt, Current, config, Power;
 extern float miliwattAVG,miliWattTime,totalPowerUsed;
 extern uint8_t STATE;
 // functions
+
+// --- Straight-line controller (USER CODE BEGIN 0) ---
+
+// Controller state
+static volatile bool tick1k = false;       // set by TIM5 ISR (1 kHz)
+static float target_mm = 0.0f;             // requested travel distance [mm]
+static float progress_mm = 0.0f;           // how far we've gone [mm] (est.)
+static int   cruise_cmd = 0;               // forward command [-99..99]
+static bool  straight_active = false;      // are we executing a straight move?
+static float gyro_bias_z = 0.0f;           // bias for IMU_Gyro[2] (deg/s)
+
+// Motor helpers
+static inline int clampi(int v, int lo, int hi){ return (v<lo)?lo:(v>hi)?hi:v; }
+static inline void set_motors(int l, int r){ MOTOR_LS = clampi(l, -99, 99); MOTOR_RS = clampi(r, -99, 99); }
+
+// ---- Calibrations (tune these on the robot) ----
+// Convert your motor command (|cmd| in 0..99) to forward speed in mm/s.
+// Start conservative; adjust until 50 command ≈ your measured speed.
+static float CMD_TO_MMPS = 5.0f;           // e.g., cmd=50 → ~250 mm/s
+// Gyro hold: how much turn correction per deg/s error
+static float Kp_gyro = 1.5f;               // start small; raise if it drifts
+
+// Early-stop front wall threshold (mm); stop before hitting the wall
+static int FRONT_STOP_MM = 120;            // tweak to taste
+
+// Start a straight move of 'distance_mm' at speed command 'cmd' (1..99)
+static void straight_start(float distance_mm, int cmd){
+  target_mm      = (distance_mm >= 0) ? distance_mm : -distance_mm;
+  progress_mm    = 0.0f;
+  cruise_cmd     = clampi(cmd, 1, 99) * (distance_mm >= 0 ? +1 : -1);
+  straight_active= true;
+
+  // Enable motors
+  HAL_GPIO_WritePin(MOTOR_EN_GPIO_Port, MOTOR_EN_Pin, GPIO_PIN_SET);
+
+  // Quick bias: average gyro for 100 ms assuming robot is stationary
+  float acc = 0.f;
+  for (int i=0;i<100;i++){
+    refreshIMUValues();     // updates IMU_Gyro[]
+    acc += IMU_Gyro[2];
+    HAL_Delay(1);
+  }
+  gyro_bias_z = acc / 100.0f;
+}
+
+// Step the straight controller at 1 kHz. Returns true when completed.
+static bool straight_step_1k(void){
+  if (!straight_active) return true;
+
+  // 1) Hold heading using gyro (deg/s). Error = measured - bias
+  float wz = IMU_Gyro[2] - gyro_bias_z;      // +ve means yawing left
+  int turn = (int)(Kp_gyro * wz);            // simple P-turn
+  int fwd  = cruise_cmd;
+
+  // Mix: differential drive = fwd ± turn
+  set_motors(fwd - turn, fwd + turn);
+
+  // 2) Distance estimate from commanded speed (mm per 1ms tick)
+  float mmps = CMD_TO_MMPS * (float)(abs(cruise_cmd));   // mm/s
+  progress_mm += (mmps / 1000.0f);                       // mm per 1 ms
+
+  // 3) Early stop if front wall approaches
+  int cmm = (int)TOF_centre_result.Distance;
+  if (cmm > 0 && cmm < FRONT_STOP_MM){
+    set_motors(0,0);
+    straight_active = false;
+    return true;
+  }
+
+  // 4) Done?
+  if (progress_mm >= target_mm){
+    set_motors(0,0);
+    straight_active = false;
+    return true;
+  }
+  return false;
+}
+
 
 void configureTimer(float desired_frequency, TIM_TypeDef* tim) {
     // Assuming the clock frequency driving the timer is 80 MHz
